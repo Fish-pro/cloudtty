@@ -29,12 +29,14 @@ import (
 	istionetworkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
@@ -319,9 +321,20 @@ func (c *CloudShellReconciler) CreateRouteRule(ctx context.Context, cloudshell *
 		}
 		accessURL = fmt.Sprintf("%s:%d", host, nodePort)
 	case cloudshellv1alpha1.ExposureIngress:
-		if err := c.CreateIngressForCloudshell(ctx, service, cloudshell); err != nil {
-			klog.ErrorS(err, "failed create ingress for cloudshell", "cloudshell", klog.KObj(cloudshell))
+		_, err := c.RESTMapper().ResourceFor(extensionsv1beta1.SchemeGroupVersion.WithResource("ingress"))
+		if err != nil && !apierrors.IsNotFound(err) {
 			return err
+		}
+		if apierrors.IsNotFound(err) {
+			if err := c.CreateIngressForCloudshell(ctx, service, cloudshell); err != nil {
+				klog.ErrorS(err, "failed create ingress for cloudshell", "cloudshell", klog.KObj(cloudshell))
+				return err
+			}
+		} else {
+			if err := c.CreateV1beta1IngressForCloudshell(ctx, service, cloudshell); err != nil {
+				klog.ErrorS(err, "failed create v1beta1 ingress for cloudshell", "cloudshell", klog.KObj(cloudshell))
+				return err
+			}
 		}
 		accessURL = SetRouteRulePath(cloudshell)
 	case cloudshellv1alpha1.ExposureVirtualService:
@@ -482,6 +495,66 @@ func (c *CloudShellReconciler) CreateIngressForCloudshell(ctx context.Context, s
 					Number: 7681,
 				},
 			},
+		},
+	})
+	// TODO: All paths will be rewritten here
+	ans := ingress.GetAnnotations()
+	if ans == nil {
+		ans = make(map[string]string)
+	}
+	ans["nginx.ingress.kubernetes.io/rewrite-target"] = "/"
+	ingress.SetAnnotations(ans)
+	return c.Update(ctx, ingress)
+}
+
+// CreateV1beta1IngressForCloudshell create ingress for cloudshell, if there isn't an ingress controller server
+// in the cluster, the ingress is still not working. before create ingress, there's must a service
+// as the ingress backend service. all of services should be loaded in an ingress "cloudshell-ingress".
+func (c *CloudShellReconciler) CreateV1beta1IngressForCloudshell(ctx context.Context, service *corev1.Service, cloudshell *cloudshellv1alpha1.CloudShell) error {
+	ingress := &extensionsv1beta1.Ingress{}
+	objectKey := IngressNamespacedName(cloudshell)
+	err := c.Get(ctx, objectKey, ingress)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	// if there is not ingress in the cluster, create the base ingress.
+	if ingress != nil && apierrors.IsNotFound(err) {
+		var ingressClassName string
+		if cloudshell.Spec.IngressConfig != nil && len(cloudshell.Spec.IngressConfig.IngressClassName) > 0 {
+			ingressClassName = cloudshell.Spec.IngressConfig.IngressClassName
+		}
+
+		// set default path prefix.
+		rulePath := SetRouteRulePath(cloudshell)
+		ingressTemplateValue := helper.NewIngressTemplateValue(objectKey, ingressClassName, service.Name, rulePath)
+		ingressBytes, err := util.ParseTemplate(manifests.IngressTmplV1beta1, ingressTemplateValue)
+
+		if err != nil {
+			return errors.Wrap(err, "failed to parse cloudshell ingress manifest")
+		}
+
+		decoder := scheme.Codecs.UniversalDeserializer()
+		obj, _, err := decoder.Decode(ingressBytes, nil, nil)
+		if err != nil {
+			klog.ErrorS(err, "failed to decode ingress manifest", "cloudshell", klog.KObj(cloudshell))
+			return err
+		}
+		ingress = obj.(*extensionsv1beta1.Ingress)
+		ingress.SetLabels(map[string]string{constants.CloudshellOwnerLabelKey: cloudshell.Name})
+
+		return c.Create(ctx, ingress)
+	}
+
+	// there is an ingress in the cluster, add a rule to the ingress.
+	IngressRule := ingress.Spec.Rules[0].IngressRuleValue.HTTP
+	pathType := extensionsv1beta1.PathTypePrefix
+	IngressRule.Paths = append(IngressRule.Paths, extensionsv1beta1.HTTPIngressPath{
+		PathType: &pathType,
+		Path:     SetRouteRulePath(cloudshell),
+		Backend: extensionsv1beta1.IngressBackend{
+			ServiceName: service.Name,
+			ServicePort: intstr.FromInt(7681),
 		},
 	})
 	// TODO: All paths will be rewritten here

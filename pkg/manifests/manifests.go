@@ -119,6 +119,24 @@ spec:
             port:
               number: 7681
 `
+	IngressTmplV1beta1 = `
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: {{ .Name }}
+  namespace: {{ .Namespace }}
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: {{ .IngressClassName }}
+  rules:
+  - http:
+      paths:
+      - path: {{ .Path }}
+        backend:
+          serviceName: {{ .ServiceName }}
+          servicePort: 7681
+`
 
 	VirtualServiceV1Beta1 = `
 apiVersion: networking.istio.io/v1beta1
